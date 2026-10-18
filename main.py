@@ -109,17 +109,7 @@ app.add_middleware(RateLimitMiddleware, limit=9, window=10)
 
 # 2. Request context (wraps rate limiter so 429 also gets x-request-id)
 app.add_middleware(RequestContextMiddleware)
-
-# 3. CORS (outermost - added LAST so it wraps every response including 429s and handles preflights)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
+ 
 
 # -----------------------------------------
 # Endpoints
@@ -135,3 +125,14 @@ async def ping(request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
+
+# 2) Add CORS LAST, so it is the outermost layer
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Request-ID", "X-Client-Id", "Idempotency-Key"],
+    expose_headers=["X-Request-ID", "Retry-After"],
+)
