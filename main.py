@@ -126,8 +126,15 @@ async def ping(request: Request):
 async def root():
     return {"status": "ok"}
 
+# --- after the request_context middleware, near the bottom of the file ---
 
-# 2) Add CORS LAST, so it is the outermost layer
+# Question 12: only the assigned origin plus an explicitly configured exam origin.
+ASSIGNED_ORIGIN = "https://app-yrrxdi.example.com"
+EXAM_ORIGIN = os.getenv("EXAM_ORIGIN", "").strip()
+allowed_origins = [ASSIGNED_ORIGIN]
+if EXAM_ORIGIN and EXAM_ORIGIN not in allowed_origins:
+    allowed_origins.append(EXAM_ORIGIN)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -135,4 +142,4 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-Request-ID", "X-Client-Id", "Idempotency-Key"],
     expose_headers=["X-Request-ID", "Retry-After"],
-)
+) 
