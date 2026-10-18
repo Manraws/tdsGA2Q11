@@ -1,126 +1,158 @@
+import os
+import base64
+import json
+import time
+import uuid
 from collections import defaultdict, deque
 from threading import Lock
-from time import monotonic
-from uuid import uuid4
-import base64
+from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 
-TOTAL_ORDERS = 55
-RATE_LIMIT = 20
-WINDOW_SECONDS = 10.0
+app = FastAPI(title="Assignment API")
 
-app = FastAPI(title="Orders API", version="1.0.0")
+# Question 12: only the assigned origin plus an explicitly configured exam origin.
+ASSIGNED_ORIGIN = "https://app-yrrxdi.example.com"
+EXAM_ORIGIN = os.getenv("EXAM_ORIGIN", "").strip()
+allowed_origins = [ASSIGNED_ORIGIN]
+if EXAM_ORIGIN and EXAM_ORIGIN not in allowed_origins:
+    allowed_origins.append(EXAM_ORIGIN)
 
-# The grader's browser can call the API cross-origin.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Retry-After"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Request-ID", "X-Client-Id", "Idempotency-Key"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
 
-# In-memory state is suitable for this single-instance grading demo.
-# For multi-worker/production deployments, use a shared database/Redis.
-state_lock = Lock()
-idempotency_records = {}
-created_orders = {}
-client_requests = defaultdict(deque)
+EMAIL = "23f3003865@ds.study.iitm.ac.in"
 
-# Fixed catalog used by pagination: IDs 1 through 55, always in order.
-catalog = [{"id": i, "name": f"Order {i}"} for i in range(1, TOTAL_ORDERS + 1)]
+# Rate-limit windows are independent by endpoint and X-Client-Id.
+WINDOW_SECONDS = 10.0
+PING_LIMIT = 9
+ORDERS_LIMIT = 20
+rate_lock = Lock()
+request_times = defaultdict(deque)
+
+# The in-memory data stores are suitable for a single long-running instance.
+# They reset when the process restarts and are not shared between instances.
+idempotency_lock = Lock()
+idempotency = {}
+catalog = [{"id": i, "name": f"Order {i}"} for i in range(1, 56)]
 
 
-class OrderCreate(BaseModel):
-    product: str = Field(default="sample-item", min_length=1)
-    quantity: int = Field(default=1, ge=1)
+def _client_key(request: Request, scope: str) -> str:
+    client_id = request.headers.get("X-Client-Id", "").strip()
+    if not client_id:
+        # Use the network peer as a fallback; never merge all anonymous clients.
+        client_id = request.client.host if request.client else "unknown"
+    return f"{scope}:{client_id}"
 
 
-@app.middleware("http")
-async def per_client_rate_limit(request: Request, call_next):
-    # CORS preflight must pass so browser verification works.
+def _rate_limit(request: Request, scope: str, limit: int):
+    # Preflight requests are handled by CORS and don't consume the application quota.
     if request.method == "OPTIONS":
-        return await call_next(request)
+        return None
 
-    client_id = request.headers.get("X-Client-Id", "anonymous")
-    now = monotonic()
-    with state_lock:
-        timestamps = client_requests[client_id]
+    now = time.monotonic()
+    key = _client_key(request, scope)
+    with rate_lock:
+        timestamps = request_times[key]
         while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
             timestamps.popleft()
-
-        if len(timestamps) >= RATE_LIMIT:
+        if len(timestamps) >= limit:
             retry_after = max(1, int(WINDOW_SECONDS - (now - timestamps[0]) + 0.999))
-            return Response(
-                content='{"detail":"Rate limit exceeded"}',
+            return JSONResponse(
                 status_code=429,
-                media_type="application/json",
+                content={"detail": "Rate limit exceeded"},
                 headers={"Retry-After": str(retry_after)},
             )
         timestamps.append(now)
-
-    return await call_next(request)
-
-
-@app.get("/")
-def root():
-    return {
-        "service": "orders-api",
-        "total_catalog_orders": TOTAL_ORDERS,
-        "rate_limit": f"{RATE_LIMIT} requests per {int(WINDOW_SECONDS)} seconds per X-Client-Id",
-        "docs": "/docs",
-    }
+    return None
 
 
-@app.post("/orders", status_code=201)
-def create_order(
-    payload: OrderCreate,
-    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    # Request context is attached to every response, including 429 responses.
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    if request.url.path == "/ping":
+        limited = _rate_limit(request, "ping", PING_LIMIT)
+        if limited is not None:
+            limited.headers["X-Request-ID"] = request_id
+            return limited
+    elif request.url.path == "/orders":
+        limited = _rate_limit(request, "orders", ORDERS_LIMIT)
+        if limited is not None:
+            limited.headers["X-Request-ID"] = request_id
+            return limited
+
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.get("/ping")
+async def ping(request: Request):
+    return {"email": EMAIL, "request_id": request.state.request_id}
+
+
+def _decode_cursor(cursor: Optional[str]) -> int:
+    if not cursor:
+        return 0
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii") + b"=" * (-len(cursor) % 4))
+        data = json.loads(raw.decode("utf-8"))
+        offset = int(data["offset"])
+        if offset < 0 or offset > len(catalog):
+            raise ValueError
+        return offset
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+
+def _encode_cursor(offset: int) -> str:
+    raw = json.dumps({"offset": offset}, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+@app.post("/orders")
+async def create_order(
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    # The lock makes key-check + create atomic for concurrent requests.
-    with state_lock:
-        if idempotency_key in idempotency_records:
-            return idempotency_records[idempotency_key]
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
 
-        order = {
-            "id": str(uuid4()),
-            "product": payload.product,
-            "quantity": payload.quantity,
-        }
-        idempotency_records[idempotency_key] = order
-        created_orders[order["id"]] = order
-        return order
+    with idempotency_lock:
+        if idempotency_key in idempotency:
+            return idempotency[idempotency_key]
+        result = {"id": str(uuid.uuid4())}
+        idempotency[idempotency_key] = result
+        return result
 
 
 @app.get("/orders")
-def list_orders(
-    limit: int = Query(default=10, ge=1, le=100),
-    cursor: str | None = Query(default=None),
+async def list_orders(
+    limit: int = Query(default=10, ge=1, le=55),
+    cursor: Optional[str] = Query(default=None),
 ):
-    # Cursor is an opaque base64url token containing the next zero-based offset.
-    offset = 0
-    if cursor:
-        try:
-            decoded = base64.urlsafe_b64decode(cursor.encode() + b"=" * (-len(cursor) % 4))
-            offset = int(decoded.decode())
-            if offset < 0 or offset > TOTAL_ORDERS:
-                raise ValueError("cursor out of range")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid cursor")
-
+    offset = _decode_cursor(cursor)
     items = catalog[offset:offset + limit]
     next_offset = offset + len(items)
-    next_cursor = (
-        base64.urlsafe_b64encode(str(next_offset).encode()).decode().rstrip("=")
-        if next_offset < TOTAL_ORDERS else None
-    )
-    return {"items": items, "next_cursor": next_cursor}
+    next_cursor = _encode_cursor(next_offset) if next_offset < len(catalog) else None
+    return {
+        "orders": items,
+        "items": items,
+        "next_cursor": next_cursor,
+        "nextCursor": next_cursor,
+    }
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.get("/")
+async def root():
+    return {"status": "ok", "docs": "/docs"}
